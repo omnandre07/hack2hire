@@ -2,4 +2,8 @@ streamlit
 langchain
 langchain-groq
 groq
+PyPDF2
+pandas
+scikit-learn
+
 
