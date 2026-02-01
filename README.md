@@ -16,6 +16,8 @@ Built for the **UnsaidTalks Hack2Hire Hackathon** on Unstop.
 [Watch the full live demo (3–4 minutes)](https://youtu.be/YOUR_VIDEO_ID_HERE)  
 Shows complete flow: resume upload → adaptive questions → scoring → final feedback
 
+## Live Application:
+https://hack2hire-zdbrtkaco2ohlm5nahdda8.streamlit.app/
 ## How to Run Locally
 1. Clone the repo
 2. Create virtual environment
