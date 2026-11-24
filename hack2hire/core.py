@@ -10,9 +10,18 @@ import math
 import re
 import time
 
-PRIMARY_MODEL = "llama-3.3-70b-versatile"
-FALLBACK_MODEL = "llama-3.1-8b-instant"  # separate free quota, used if the primary is rate-limited
-WHISPER_MODEL = "whisper-large-v3-turbo"  # Groq free-tier speech-to-text
+import os
+
+# Groq retired llama-3.3-70b-versatile / llama-3.1-8b-instant for free accounts on 16 Aug 2026.
+# Models are tried in this order; at startup the list is filtered to what your key can actually use
+# (client.models.list()), so a future deprecation doesn't break the app.
+# Override with env vars: GROQ_MODEL=<id> (tried first), GROQ_STT_MODEL=<id>.
+PREFERRED_CHAT = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b",
+                  "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+PREFERRED_STT = ["whisper-large-v3-turbo", "whisper-large-v3"]
+CHAT_MODELS = list(PREFERRED_CHAT)
+STT_MODELS = list(PREFERRED_STT)
+_NOT_CHAT = ("whisper", "guard", "safeguard", "tts", "orpheus", "playai", "embed")
 RETRY_DELAY = 1.0
 
 LEVELS = ["Easy", "Medium", "Hard"]
@@ -70,30 +79,64 @@ def extract_json(text):
 
 
 # ---------------- LLM access ----------------
+def configure_models(client):
+    """Keep only models this key can use; fall back to the preferred lists if the lookup fails."""
+    global CHAT_MODELS, STT_MODELS
+    chat_pref, stt_pref = list(PREFERRED_CHAT), list(PREFERRED_STT)
+    if os.getenv("GROQ_MODEL"):
+        chat_pref.insert(0, os.environ["GROQ_MODEL"])
+    if os.getenv("GROQ_STT_MODEL"):
+        stt_pref.insert(0, os.environ["GROQ_STT_MODEL"])
+    try:
+        ids = {m.id for m in client.models.list().data}
+    except Exception:
+        CHAT_MODELS, STT_MODELS = chat_pref, stt_pref
+        return
+    chat_ok = [m for m in chat_pref if m in ids]
+    if not chat_ok:  # none of our preferred ones exist any more: use whatever chat models are offered
+        chat_ok = sorted(i for i in ids if not any(t in i.lower() for t in _NOT_CHAT))
+    CHAT_MODELS = chat_ok or chat_pref
+    STT_MODELS = [m for m in stt_pref if m in ids] or stt_pref
+
+
 def get_client(api_key):
     from groq import Groq
 
-    return Groq(api_key=api_key)
+    client = Groq(api_key=api_key)
+    configure_models(client)
+    return client
+
+
+def _status(e):
+    return getattr(e, "status_code", None)
 
 
 def chat(client, messages, json_mode=False, temperature=0.4, max_tokens=800):
-    """Call Groq with retry, then fall back to the smaller free model."""
-    last_err = None
-    attempts = [(m, a) for m in (PRIMARY_MODEL, FALLBACK_MODEL) for a in range(2)]
-    for i, (model, _) in enumerate(attempts):
-        try:
-            kw = dict(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
-            if json_mode:
-                kw["response_format"] = {"type": "json_object"}
-            content = client.chat.completions.create(**kw).choices[0].message.content
-            if content and content.strip():
-                return content.strip()
-            last_err = RuntimeError("empty response")
-        except Exception as e:  # rate limit, network, bad request...
-            last_err = e
-        if i < len(attempts) - 1:
+    """Call Groq, retrying transient errors and moving on to the next free model when needed."""
+    errors = []
+    for model in CHAT_MODELS:
+        reasoning = model.startswith("openai/gpt-oss")
+        for attempt in range(2):
+            try:
+                kw = dict(model=model, messages=messages, temperature=temperature,
+                          # reasoning models spend part of the token budget on hidden thinking
+                          max_tokens=max_tokens + (1200 if reasoning else 0))
+                if reasoning:
+                    kw["reasoning_effort"] = "low"
+                if json_mode:
+                    kw["response_format"] = {"type": "json_object"}
+                content = client.chat.completions.create(**kw).choices[0].message.content
+                if content and content.strip():
+                    return content.strip()
+                errors.append(f"{model}: empty response")
+            except Exception as e:
+                if _status(e) == 401:
+                    raise RuntimeError("Invalid GROQ_API_KEY. Create a new free key at console.groq.com/keys.")
+                errors.append(f"{model}: {str(e)[:160]}")
+                if _status(e) in (400, 404):  # model gone / unsupported option: retrying won't help
+                    break
             time.sleep(RETRY_DELAY)
-    raise RuntimeError(f"AI service unavailable ({last_err}). Please retry in a moment.")
+    raise RuntimeError("AI service unavailable. Tried: " + " | ".join(errors[-4:]))
 
 
 def llm_json(client, messages, **kw):
@@ -332,6 +375,12 @@ def report_markdown(profile, jd, history, summary, gap=None):
 
 # ---------------- speech to text (Groq free tier) ----------------
 def transcribe(client, audio_bytes, filename="answer.wav"):
-    r = client.audio.transcriptions.create(file=(filename, audio_bytes), model=WHISPER_MODEL,
-                                           response_format="text")
-    return (r if isinstance(r, str) else getattr(r, "text", "")).strip()
+    last = None
+    for model in STT_MODELS:
+        try:
+            r = client.audio.transcriptions.create(file=(filename, audio_bytes), model=model,
+                                                   response_format="text")
+            return (r if isinstance(r, str) else getattr(r, "text", "")).strip()
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"Speech-to-text unavailable: {last}")
